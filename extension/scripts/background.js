@@ -38,6 +38,29 @@ async function queryLinearApi(query) {
 // Currently handles messages containing a `linearQuery` GraphQL query,
 // responding with data from the Linear API. All other messages will return null.
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  // Handle opening URLs in existing Linear tabs
+  if (request && request.action === 'openInLinearTab') {
+    chrome.tabs.query({}, (tabs) => {
+      // Find an existing Linear tab
+      const linearTab = tabs.find(tab => tab.url && tab.url.startsWith('https://linear.app/'));
+
+      if (linearTab && linearTab.id) {
+        // Update existing tab and focus it
+        chrome.tabs.update(linearTab.id, { url: request.url, active: true }, () => {
+          chrome.windows.update(linearTab.windowId, { focused: true });
+          sendResponse({ success: true });
+        });
+      } else {
+        // No Linear tab found, open in new tab
+        chrome.tabs.create({ url: request.url }, () => {
+          sendResponse({ success: true });
+        });
+      }
+    });
+    return true; // Keep the message channel open for async response
+  }
+
+  // Handle GraphQL queries
   let query = Promise.resolve(null);
   if (request && typeof request === 'object' && 'linearQuery' in request) {
     query = queryLinearApi(request.linearQuery);

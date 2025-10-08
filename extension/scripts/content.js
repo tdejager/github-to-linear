@@ -1,11 +1,30 @@
 // Run on page load.
+console.log('[github-to-linear] Extension loaded');
 init();
 // Run on each client-side navigation.
 document.addEventListener('turbo:render', init);
+// Run on browser back/forward navigation
+window.addEventListener('popstate', init);
+// Also try listening to GitHub's soft-nav events
+document.addEventListener('soft-nav:end', init);
 
 function init() {
+  console.log('[github-to-linear] Init called');
   injectSingleIssueUI();
   injectIssueListUI();
+}
+
+/**
+ * Open a URL in an existing Linear tab if one exists, otherwise open a new tab.
+ * @param {string} url The URL to open
+ */
+function openInLinearTab(url) {
+  chrome.runtime.sendMessage({ action: 'openInLinearTab', url }, (response) => {
+    if (!response?.success) {
+      // Fallback: open in new tab if message fails
+      window.open(url, '_blank');
+    }
+  });
 }
 
 /**
@@ -62,71 +81,162 @@ function InlineIssueLink(linearIssue) {
  * Otherwise, injects a link to create a new Linear issue linking to this page.
  */
 async function injectSingleIssueUI() {
-  /** ID for the link we’ll create. */
+  console.log('[github-to-linear] injectSingleIssueUI called');
+  /** ID for the link we'll create. */
   const linkId = 'github-to-linear-create-issue-link';
-  // We already created our link. Let’s chill.
-  if (document.getElementById(linkId)) return;
-
-  // Parse the current URL to grab some information about the issue or PR.
-  const issueMetaData = parseGitHubUrl(location);
-  // If we’re not in an issue or PR we can return early.
-  if (!issueMetaData) return;
-
-  // The header section of an issue/PR we want to inject our link into.
-  const headerMeta = document.querySelector('.gh-header-meta');
-  if (!headerMeta) {
-    console.error('Could not find header meta to inject into.');
+  // We already created our link. Let's chill.
+  if (document.getElementById(linkId)) {
+    console.log('[github-to-linear] Link already exists');
     return;
   }
 
-  // Grab the issue or PR title (thank you GH for using the same class for both).
-  const titleEl = document.querySelector('.js-issue-title');
-  const issueTitle = titleEl?.textContent;
+  // Parse the current URL to grab some information about the issue or PR.
+  const issueMetaData = parseGitHubUrl(location);
+  console.log('[github-to-linear] Parsed metadata:', issueMetaData);
+  // If we're not in an issue or PR we can return early.
+  if (!issueMetaData) {
+    console.log('[github-to-linear] Not on an issue/PR page');
+    return;
+  }
+
+  // Find the issue number element to inject our link after (e.g., "#4573")
+  const issueNumberEl = document.querySelector('.gh-header-number') ||
+                        document.querySelector('span[data-hovercard-type="issue"]') ||
+                        document.querySelector('span[data-hovercard-type="pull_request"]') ||
+                        // Try finding by text content matching #number pattern
+                        [...document.querySelectorAll('span')].find(el =>
+                          el.textContent?.trim().match(/^#\d+$/)
+                        );
+
+  if (!issueNumberEl) {
+    console.log('[github-to-linear] Could not find issue number element');
+    console.log('[github-to-linear] Available span elements with #:',
+      [...document.querySelectorAll('span')].filter(el => el.textContent?.includes('#')).map(el => ({
+        text: el.textContent,
+        class: el.className
+      })));
+    return;
+  }
+  console.log('[github-to-linear] Found issue number element:', issueNumberEl);
+
+  // Find the title for getting text content
+  const titleContainer = document.querySelector('bdi.js-issue-title') ||
+                         document.querySelector('.js-issue-title') ||
+                         document.querySelector('bdi.markdown-title');
+  const issueTitle = titleContainer?.textContent;
+  console.log('[github-to-linear] Issue title:', issueTitle);
 
   const identifier = makeGitHubIdentifier(issueMetaData);
   let title = identifier;
   if (issueTitle) title += ' — ' + issueTitle;
   const typeLabel = issueMetaData.type === 'pull' ? 'PR' : 'Issue';
   const cleanedUrl = cleanUrl(issueMetaData.number)
+  console.log('[github-to-linear] Cleaned URL:', cleanedUrl);
   const description = `GitHub ${typeLabel}: ${cleanedUrl}`;
   const newIssueUrl = await getNewIssueUrl(title, description);
+  console.log('[github-to-linear] New issue URL:', newIssueUrl);
 
-  const issues = await fetchExistingIssues({ url: cleanedUrl, identifier });
-  const linearIssue = issues?.[0];
-
-  const ButtonGroup = h(
-    'div',
-    { id: linkId, class: 'BtnGroup flex-self-start ml-auto' },
-    // Main link to an existing issue or to create a new issue on Linear.
-    h(
-      'a',
-      {
-        href: linearIssue ? linearIssue.url : newIssueUrl,
-        class: 'BtnGroup-item rounded-left-2 btn btn-sm',
-      },
-      h(
-        'span',
-        { class: 'gh2l-icon-text-lockup' },
-        LinearLogo(),
-        linearIssue ? linearIssue.identifier : 'Add to Linear'
-      )
-    ),
-    // If there’s an existing issue, also show a smaller “+” button to for making new issues.
-    linearIssue
-      ? h(
-          'a',
-          {
-            class: 'BtnGroup-item btn btn-sm',
-            title: 'Create new Linear issue',
-            href: newIssueUrl,
-          },
-          PlusIcon()
-        )
-      : ''
+  // Show loading indicator
+  const loadingIndicator = h(
+    'span',
+    {
+      id: linkId,
+      class: 'ml-2',
+      style: 'display: inline-flex; align-items: center; gap: 4px; opacity: 0.5;',
+    },
+    h('span', {
+      style: 'width: 16px; height: 16px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite;',
+      'aria-label': 'Loading Linear issue...'
+    })
   );
 
-  // Inject the link into the page.
-  headerMeta.append(ButtonGroup);
+  // Inject loading indicator
+  issueNumberEl.parentElement?.insertBefore(
+    loadingIndicator,
+    issueNumberEl.nextSibling
+  );
+
+  // Add keyframe animation for the spinner if not already added
+  if (!document.getElementById('gh2l-spinner-style')) {
+    const style = document.createElement('style');
+    style.id = 'gh2l-spinner-style';
+    style.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
+    document.head.appendChild(style);
+  }
+
+  console.log('[github-to-linear] Fetching existing issues...');
+  const issues = await fetchExistingIssues({ url: cleanedUrl, identifier });
+  console.log('[github-to-linear] Fetched issues:', issues);
+  const linearIssue = issues?.[0];
+  console.log('[github-to-linear] Selected linear issue:', linearIssue);
+
+  // Remove loading indicator
+  loadingIndicator.remove();
+
+  if (linearIssue) {
+    // Create an inline link next to the title
+    // Match the issue number element's computed styles
+    const issueNumberStyles = window.getComputedStyle(issueNumberEl);
+    const logo = LinearLogo(linearIssue.team?.color);
+    logo.style.verticalAlign = 'middle';
+    logo.style.marginRight = '4px';
+
+    const linearLink = h(
+      'a',
+      {
+        id: linkId,
+        href: linearIssue.url,
+        class: 'Link--muted',
+        style: `text-decoration: none; display: inline; font-size: ${issueNumberStyles.fontSize}; line-height: ${issueNumberStyles.lineHeight}; margin-left: 0.5rem;`,
+        title: linearIssue.title,
+      },
+      logo,
+      h('span', { style: 'font-weight: normal;' }, linearIssue.identifier)
+    );
+    linearLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      openInLinearTab(linearIssue.url);
+    });
+
+    // Inject after the issue number
+    console.log('[github-to-linear] Injecting Linear link after issue number');
+    issueNumberEl.parentElement?.insertBefore(
+      linearLink,
+      issueNumberEl.nextSibling
+    );
+    console.log('[github-to-linear] Link injected successfully');
+  } else {
+    // No linked issue found, create "Add to Linear" link
+    const issueNumberStyles = window.getComputedStyle(issueNumberEl);
+    const logo = LinearLogo();
+    logo.style.verticalAlign = 'middle';
+    logo.style.marginRight = '4px';
+
+    const addLink = h(
+      'a',
+      {
+        id: linkId,
+        href: newIssueUrl,
+        class: 'Link--muted',
+        style: `text-decoration: none; display: inline; font-size: ${issueNumberStyles.fontSize}; line-height: ${issueNumberStyles.lineHeight}; margin-left: 0.5rem; opacity: 0.6;`,
+        title: 'Add to Linear',
+      },
+      logo,
+      h('span', { style: 'font-weight: normal;' }, '+')
+    );
+    addLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      openInLinearTab(newIssueUrl);
+    });
+
+    console.log('[github-to-linear] Injecting "Add to Linear" link after issue number');
+    issueNumberEl.parentElement?.insertBefore(
+      addLink,
+      issueNumberEl.nextSibling
+    );
+    console.log('[github-to-linear] Link injected successfully');
+  }
+
   injectSidebarUI(issues);
 }
 
@@ -181,7 +291,7 @@ function injectSidebarUI(issues) {
   }
   const sidebar = document.querySelector('.Layout-sidebar');
   if (!sidebar) {
-    console.error('Could not find page sidebar.');
+    // Sidebar doesn't exist on all GitHub layouts, silently skip
     return;
   }
 
@@ -598,14 +708,67 @@ async function getNewIssueUrl(title, description) {
  */
 async function fetchExistingIssues(currentIssue) {
   const issues = [currentIssue, ...getLinkedIssues()];
+  console.log('[github-to-linear] Searching for issues:', issues);
 
-  /** Format a block of GraphQL filter predicates for a given GitHub issue.  */
+  // First, search by attachments with exact URL matching
+  const attachmentResults = await Promise.all(
+    issues.map(({ url }) =>
+      new Promise((resolve) => {
+        console.log('[github-to-linear] Querying attachments for URL:', url);
+        chrome.runtime.sendMessage(
+          {
+            linearQuery: `{
+  attachments(filter: { url: { eq: "${url}" } }, first: 5) {
+    nodes {
+      issue {
+        url
+        identifier
+        title
+        branchName
+        state { name color type }
+        priorityLabel
+        priority
+        assignee { avatarUrl displayName isMe url }
+        cycle { name startsAt endsAt }
+        project { name url }
+        dueDate
+        labels {
+          nodes { name color }
+        }
+        team { color }
+      }
+    }
+  }
+}`,
+          },
+          (response) => {
+            console.log('[github-to-linear] Attachment query response:', response);
+            resolve(response);
+          }
+        )
+      })
+    )
+  );
+
+  // Extract issues from attachments
+  const attachmentIssues = attachmentResults
+    .flatMap(r => r?.data?.attachments?.nodes || [])
+    .map(node => node.issue)
+    .filter(Boolean);
+
+  console.log('[github-to-linear] Found issues via attachments:', attachmentIssues);
+
+  // If we found issues via attachments, return them
+  if (attachmentIssues.length > 0) {
+    return attachmentIssues;
+  }
+
+  // Fallback: search by title/description containing identifier or URL
   const makeFilterBlock = ({ url, identifier }) =>
     `{ description: { containsIgnoreCase: "${identifier}" } }
       { description: { containsIgnoreCase: "${url}" }  }
       { title: { containsIgnoreCase: "${identifier}" } }
-      { title: { containsIgnoreCase: "${url}" } }
-      { attachments: { url: { containsIgnoreCase: "${url}" } } }`;
+      { title: { containsIgnoreCase: "${url}" } }`;
 
   const response = await new Promise((resolve) => {
     // Use callback-style of sendMessage because Promise-style requires Manifest v3 in Chrome.
@@ -641,7 +804,7 @@ async function fetchExistingIssues(currentIssue) {
   }
 }`,
       },
-      // @ts-expect-error `chrome-types` doesn’t cover this signature, but it does work.
+      // @ts-expect-error `chrome-types` doesn't cover this signature, but it does work.
       (response) => resolve(response)
     );
   });
